@@ -1,0 +1,195 @@
+// Offline tests: every request goes to a fake fetch, nothing leaves the machine.
+import { readFileSync } from 'node:fs';
+import { generateImage, generateText, Output, streamText } from 'ai';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { createUberLLM, listModels, uberllm, VERSION } from '../src/index';
+
+type Call = { url: string; headers: Record<string, string>; body: any };
+
+function fakeFetch(respond: (call: Call) => Response) {
+  const calls: Call[] = [];
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = Object.fromEntries(new Headers(init?.headers).entries());
+    const call: Call = {
+      url: String(input),
+      headers,
+      body: init?.body ? JSON.parse(String(init.body)) : undefined,
+    };
+    calls.push(call);
+    return respond(call);
+  };
+  return { fetch: fetch as typeof globalThis.fetch, calls };
+}
+
+const chatCompletion = (content: string) =>
+  Response.json({
+    id: 'chatcmpl-1',
+    object: 'chat.completion',
+    created: 1,
+    model: 'deepseek/deepseek-v4-flash',
+    choices: [
+      { index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' },
+    ],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  });
+
+let savedKey: string | undefined;
+beforeEach(() => {
+  savedKey = process.env.UBERLLM_API_KEY;
+  delete process.env.UBERLLM_API_KEY;
+});
+afterEach(() => {
+  if (savedKey === undefined) delete process.env.UBERLLM_API_KEY;
+  else process.env.UBERLLM_API_KEY = savedKey;
+});
+
+describe('createUberLLM', () => {
+  it('sends chat requests to UberLLM with the key and identifying headers', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('hello'));
+    const p = createUberLLM({
+      apiKey: 'ull_test',
+      appName: 'My App',
+      appUrl: 'https://example.com',
+      fetch,
+    });
+    const { text, usage } = await generateText({
+      model: p('deepseek/deepseek-v4-flash'),
+      prompt: 'hi',
+    });
+    expect(text).toBe('hello');
+    expect(usage.totalTokens).toBe(8);
+    expect(calls[0].url).toBe('https://api.uberllm.dev/v1/chat/completions');
+    expect(calls[0].headers.authorization).toBe('Bearer ull_test');
+    expect(calls[0].headers['x-title']).toBe('My App');
+    expect(calls[0].headers['http-referer']).toBe('https://example.com');
+    expect(calls[0].body.model).toBe('deepseek/deepseek-v4-flash');
+  });
+
+  it('reads UBERLLM_API_KEY when the request is made, not at import', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('ok'));
+    const p = createUberLLM({ fetch }); // no key yet: must not throw
+    process.env.UBERLLM_API_KEY = 'ull_env';
+    await generateText({ model: p('m'), prompt: 'hi' });
+    expect(calls[0].headers.authorization).toBe('Bearer ull_env');
+  });
+
+  it('accepts an async key function', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('ok'));
+    const p = createUberLLM({ apiKey: async () => 'ull_fn', fetch });
+    await generateText({ model: p.chatModel('m'), prompt: 'hi' });
+    expect(calls[0].headers.authorization).toBe('Bearer ull_fn');
+  });
+
+  it('fails with a clear error when there is no key', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('ok'));
+    const p = createUberLLM({ fetch });
+    await expect(
+      generateText({ model: p('m'), prompt: 'hi', maxRetries: 0 }),
+    ).rejects.toThrow(/UBERLLM_API_KEY/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('honours a custom baseURL (trailing slash removed)', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('ok'));
+    const p = createUberLLM({ apiKey: 'k', baseURL: 'https://proxy.test/v1/', fetch });
+    await generateText({ model: p.languageModel('m'), prompt: 'hi' });
+    expect(calls[0].url).toBe('https://proxy.test/v1/chat/completions');
+  });
+
+  it('streams with usage included', async () => {
+    const sse = [
+      { choices: [{ index: 0, delta: { role: 'assistant', content: 'Hel' } }] },
+      { choices: [{ index: 0, delta: { content: 'lo' }, finish_reason: 'stop' }] },
+      { choices: [], usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 } },
+    ]
+      .map((c) => `data: ${JSON.stringify({ id: 'x', created: 1, model: 'm', ...c })}\n\n`)
+      .join('') + 'data: [DONE]\n\n';
+    const { fetch, calls } = fakeFetch(
+      () => new Response(sse, { headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const p = createUberLLM({ apiKey: 'k', fetch });
+    const result = streamText({ model: p('m'), prompt: 'hi' });
+    let text = '';
+    for await (const d of result.textStream) text += d;
+    expect(text).toBe('Hello');
+    expect((await result.usage).totalTokens).toBe(4);
+    expect(calls[0].body.stream).toBe(true);
+    expect(calls[0].body.stream_options).toEqual({ include_usage: true });
+  });
+
+  it('sends json_schema for structured output', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('{"name":"Ada","age":36}'));
+    const p = createUberLLM({ apiKey: 'k', fetch });
+    const { output } = await generateText({
+      model: p('m'),
+      output: Output.object({ schema: z.object({ name: z.string(), age: z.number() }) }),
+      prompt: 'Ada is 36',
+    });
+    expect(output).toEqual({ name: 'Ada', age: 36 });
+    expect(calls[0].body.response_format.type).toBe('json_schema');
+  });
+
+  it('passes UberLLM routing options through providerOptions.uberllm', async () => {
+    const { fetch, calls } = fakeFetch(() => chatCompletion('ok'));
+    const p = createUberLLM({ apiKey: 'k', fetch });
+    await generateText({
+      model: p('m'),
+      prompt: 'hi',
+      providerOptions: {
+        uberllm: { provider: { max_price: { prompt: 0.2, completion: 0.4 } } },
+      },
+    });
+    expect(calls[0].body.provider).toEqual({ max_price: { prompt: 0.2, completion: 0.4 } });
+  });
+
+  it('generates images through /v1/images/generations', async () => {
+    const png = Buffer.from('fake-png').toString('base64');
+    const { fetch, calls } = fakeFetch(() =>
+      Response.json({ created: 1, data: [{ b64_json: png }] }),
+    );
+    const p = createUberLLM({ apiKey: 'k', fetch });
+    const { image } = await generateImage({
+      model: p.imageModel('black-forest-labs/flux.2-klein-4b'),
+      prompt: 'a red bicycle',
+      size: '1024x1024',
+    });
+    expect(Buffer.from(image.uint8Array).toString()).toBe('fake-png');
+    expect(calls[0].url).toBe('https://api.uberllm.dev/v1/images/generations');
+    expect(calls[0].body.model).toBe('black-forest-labs/flux.2-klein-4b');
+  });
+
+  it('has no embeddings model', () => {
+    expect(() => uberllm.embeddingModel('x')).toThrow(/no embeddings/);
+    expect(() => uberllm.textEmbeddingModel('x')).toThrow(/no embeddings/);
+  });
+
+  it('identifies as the uberllm provider', () => {
+    expect(uberllm('m').provider).toBe('uberllm.chat');
+    expect(uberllm.specificationVersion).toBe('v4');
+  });
+});
+
+describe('listModels', () => {
+  it('fetches chat models by default and other types on request', async () => {
+    const { fetch, calls } = fakeFetch(() =>
+      Response.json({ data: [{ id: 'deepseek/deepseek-v4-flash' }] }),
+    );
+    expect(await listModels({ fetch })).toEqual([{ id: 'deepseek/deepseek-v4-flash' }]);
+    expect(calls[0].url).toBe('https://api.uberllm.dev/v1/models');
+    expect(calls[0].headers.authorization).toBeUndefined();
+    await listModels({ fetch, type: 'image', apiKey: 'k' });
+    expect(calls[1].url).toBe('https://api.uberllm.dev/v1/models?type=image');
+    expect(calls[1].headers.authorization).toBe('Bearer k');
+  });
+
+  it('throws on an error status', async () => {
+    const { fetch } = fakeFetch(() => new Response('nope', { status: 500 }));
+    await expect(listModels({ fetch })).rejects.toThrow(/500/);
+  });
+});
+
+it('VERSION matches package.json', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  expect(VERSION).toBe(pkg.version);
+});
